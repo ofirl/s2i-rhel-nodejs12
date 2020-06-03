@@ -1,0 +1,482 @@
+#!/bin/bash
+#
+# The 'run' performs a simple test that verifies that STI image.
+# The main focus here is to exercise the STI scripts.
+#
+# IMAGE_NAME specifies a name of the candidate image used for testing.
+# The image has to be available before this script is executed.
+#
+# EXPRESS_REVISION specifies which express.js branch or tag should be tested;
+# by default it uses the latest released version as reported by
+# `npm show express version`.
+
+THISDIR=$(dirname ${BASH_SOURCE[0]})
+
+source "${THISDIR}/test-lib.sh"
+
+test -n $IMAGE_NAME \
+  -a -n $VERSION
+readonly EXPRESS_REVISION="${EXPRESS_REVISION:-$(docker run --rm "${IMAGE_NAME}" -- npm show express version)}"
+
+test_dir="$(readlink -f $(dirname ${BASH_SOURCE[0]}))"
+image_dir="$(readlink -f ${test_dir}/..)"
+cid_file=$(mktemp -u --suffix=.cid)
+
+# Since we built the candidate image locally, we don't want S2I attempt to pull
+# it from Docker hub
+s2i_args="--pull-policy=never "
+
+# TODO: This should be part of the image metadata
+test_port=8080
+
+# Common git configuration
+readonly -A gitconfig=(
+  [user.name]="builder"
+  [user.email]="build@localhost"
+  [commit.gpgsign]="false"
+)
+
+info() {
+  echo -e "\n\e[1m[INFO] $@...\e[0m\n"
+}
+
+if [ "$DEBUG" != "" ]; then
+  set -x
+fi
+
+image_exists() {
+  docker inspect $1 &>/dev/null
+}
+
+container_exists() {
+  image_exists $(cat $cid_file)
+}
+
+container_ip() {
+  docker inspect --format="{{ .NetworkSettings.IPAddress }}" $(cat $cid_file)
+}
+
+container_logs() {
+  docker logs $(cat $cid_file)
+}
+
+run_s2i_build() {
+  ct_s2i_build_as_df file://${test_dir}/test-app ${IMAGE_NAME} ${IMAGE_NAME}-testapp ${s2i_args} $(ct_build_s2i_npm_variables) $1
+}
+
+run_s2i_build_proxy() {
+  ct_s2i_build_as_df file://${test_dir}/test-hw ${IMAGE_NAME} ${IMAGE_NAME}-testhw ${s2i_args} $(ct_build_s2i_npm_variables) -e HTTP_PROXY=$1 -e http_proxy=$1 -e HTTPS_PROXY=$2 -e https_proxy=$2
+}
+
+run_s2i_build_express() {
+  ct_s2i_build_as_df \
+    "file://${test_dir}/express.js" "${IMAGE_NAME}" "${IMAGE_NAME}-express" \
+    ${s2i_args} \
+    $(ct_build_s2i_npm_variables) -e NODE_ENV=development
+}
+
+prepare_dummy_git_repo() {
+  git init
+  for key in "${!gitconfig[@]}"; do
+    git config --local "$key" "${gitconfig[$key]}"
+  done
+  git add --all
+  git commit -m "Sample commit"
+}
+
+prepare_express_repo() {
+  git clone \
+    --config advice.detachedHead="false" \
+    --branch "${EXPRESS_REVISION}" --depth 1 \
+    'https://github.com/expressjs/express.git' "$1"
+  pushd "$1" >/dev/null || return
+  for key in "${!gitconfig[@]}"; do
+    git config --local "$key" "${gitconfig[$key]}"
+  done
+  popd >/dev/null || return
+}
+
+prepare() {
+  if ! image_exists ${IMAGE_NAME}; then
+    echo "ERROR: The image ${IMAGE_NAME} must exist before this script is executed."
+    exit 1
+  fi
+
+  case "$1" in
+    # TODO: STI build require the application is a valid 'GIT' repository, we
+    # should remove this restriction in the future when a file:// is used.
+    app|hw|express-webapp)
+      pushd "${test_dir}/test-${1}" >/dev/null
+      prepare_dummy_git_repo
+      popd >/dev/null
+      ;;
+    express)
+      prepare_express_repo "${test_dir}/express.js"
+      ;;
+    *)
+      echo "Please specify a valid test application"
+      exit 1
+      ;;
+  esac
+}
+
+run_test_application() {
+    if [[ $1 == app ]]; then
+        docker run --user=100001 $(ct_mount_ca_file) --rm --cidfile=${cid_file} $2 ${IMAGE_NAME}-testapp
+    elif [[ $1 == hw ]]; then
+        docker run --user=100001 $(ct_mount_ca_file) --rm --cidfile=${cid_file} $2 ${IMAGE_NAME}-testhw
+    elif [[ $1 == express-webapp ]]; then
+        docker run --user=100001 $(ct_mount_ca_file) --rm --cidfile=${cid_file} $2 ${IMAGE_NAME}-testexpresswebapp
+    else
+        echo "No such test application"
+        exit 1
+    fi
+}
+
+run_express_test_suite() {
+  docker run --user=100001 $(ct_mount_ca_file) --rm --cidfile=${cid_file} ${IMAGE_NAME}-express npm test
+}
+
+kill_test_application() {
+	docker kill $(cat $cid_file)
+	rm $cid_file
+}
+
+cleanup() {
+  if [ -f $cid_file ]; then
+      if container_exists; then
+          docker stop $(cat $cid_file)
+      fi
+  fi
+
+  for image in "${IMAGE_NAME}"-{test{app,hw,expresswebapp},express}; do
+    image_exists "$image" || continue
+    docker rmi -f "$image"
+  done
+
+  rm -rf ${test_dir}/test-app/.git
+  rm -rf ${test_dir}/test-hw/.git
+  rm -rf "${test_dir}/express.js"
+  rm -rf ${test_dir}/test-express-webapp/.git
+}
+
+check_result() {
+  local result="$1"
+  if [[ "$result" != "0" ]]; then
+    echo "S2I image '${IMAGE_NAME}' test FAILED (exit code: ${result})"
+    cleanup
+    exit $result
+  fi
+}
+
+wait_for_cid() {
+  local max_attempts=20
+  local sleep_time=1
+  local attempt=1
+  local result=1
+  while [ $attempt -le $max_attempts ]; do
+    [ -f $cid_file ] && [ -s $cid_file ] && break
+    echo "Waiting for container start..."
+    attempt=$(( $attempt + 1 ))
+    sleep $sleep_time
+  done
+}
+
+test_s2i_usage() {
+  echo "Testing 's2i usage'..."
+  ct_s2i_usage ${IMAGE_NAME} ${s2i_args} &>/dev/null
+}
+
+test_docker_run_usage() {
+  echo "Testing 'docker run' usage..."
+  docker run --rm ${IMAGE_NAME} &>/dev/null
+}
+
+test_connection() {
+  echo "Testing HTTP connection..."
+  local max_attempts=10
+  local sleep_time=1
+  local attempt=1
+  local result=1
+  while [ $attempt -le $max_attempts ]; do
+    echo "Sending GET request to http://$(container_ip):${test_port}/"
+    response_code=$(curl -s -w %{http_code} -o /dev/null http://$(container_ip):${test_port}/)
+    status=$?
+    if [ $status -eq 0 ]; then
+      if [ $response_code -eq 200 ]; then
+        result=0
+      fi
+      break
+    fi
+    attempt=$(( $attempt + 1 ))
+    sleep $sleep_time
+  done
+  return $result
+}
+
+test_scl_usage() {
+  local run_cmd="$1"
+  local expected="$2"
+
+  echo "Testing the image SCL enable ..."
+  out=$(docker run --rm ${IMAGE_NAME} /bin/bash -c "${run_cmd}")
+  if ! echo "${out}" | grep -q "${expected}"; then
+    echo "ERROR[/bin/bash -c "${run_cmd}"] Expected '${expected}', got '${out}'"
+    return 1
+  fi
+  out=$(docker exec $(cat ${cid_file}) /bin/bash -c "${run_cmd}" 2>&1)
+  if ! echo "${out}" | grep -q "${expected}"; then
+    echo "ERROR[exec /bin/bash -c "${run_cmd}"] Expected '${expected}', got '${out}'"
+    return 1
+  fi
+  out=$(docker exec $(cat ${cid_file}) /bin/sh -ic "${run_cmd}" 2>&1)
+  if ! echo "${out}" | grep -q "${expected}"; then
+    echo "ERROR[exec /bin/sh -ic "${run_cmd}"] Expected '${expected}', got '${out}'"
+    return 1
+  fi
+}
+
+validate_default_value() {
+  local label=$1
+
+  IFS=':' read -a label_vals <<< $(docker inspect -f "{{index .Config.Labels \"$label\"}}" ${IMAGE_NAME})
+  label_var=${label_vals[0]}
+  default_label_val=${label_vals[1]}
+
+  actual_label_val=$(docker run --rm $IMAGE_NAME /bin/bash -c "echo $"$label_var)
+
+  if [ "$actual_label_val" != "$default_label_val" ]; then
+    echo "ERROR default value for $label with environment variable $label_var; Expected $default_label_val, got $actual_label_val"
+    return 1
+  fi
+}
+
+# Gets the NODE_ENV environment variable from the container.
+get_node_env_from_container() {
+  local dev_mode="$1"
+  local node_env="$2"
+
+  IFS=':' read -a label_val <<< $(docker inspect -f '{{index .Config.Labels "com.redhat.dev-mode"}}' $IMAGE_NAME)
+  dev_mode_label_var="${label_val[0]}"
+
+  echo $(docker run --rm --env $dev_mode_label_var=$dev_mode --env NODE_ENV=$node_env $IMAGE_NAME /bin/bash -c 'echo "$NODE_ENV"')
+}
+
+# Ensures that a docker container run with '--env NODE_ENV=$current_val' produces a NODE_ENV value of $expected when
+# DEV_MODE=dev_mode.
+validate_node_env() {
+  local current_val="$1"
+  local dev_mode_val="$2"
+  local expected="$3"
+
+  actual=$(get_node_env_from_container "$dev_mode_val" "$current_val")
+  if [ "$actual" != "$expected" ]; then
+    echo "ERROR default value for NODE_ENV when development mode is $dev_mode_val; should be $expected but is $actual"
+    return 1
+  fi
+}
+
+test_dev_mode() {
+  local app=$1
+  local dev_mode=$2
+  local node_env=$3
+
+  echo "Testing $app DEV_MODE=$dev_mode NODE_ENV=$node_env"
+
+  run_test_application $app "-e DEV_MODE=$dev_mode" &
+  wait_for_cid
+
+  test_connection
+  check_result $?
+
+  logs=$(container_logs)
+  echo ${logs} | grep -q DEV_MODE=$dev_mode
+  check_result $?
+  echo ${logs} | grep -q DEBUG_PORT=5858
+  check_result $?
+  echo ${logs} | grep -q NODE_ENV=$node_env
+  check_result $?
+
+  kill_test_application
+}
+
+test_incremental_build() {
+  npm_variables=$(ct_build_s2i_npm_variables)
+  build_log1=$(ct_s2i_build_as_df file://${test_dir}/test-incremental ${IMAGE_NAME} ${IMAGE_NAME}-testapp ${s2i_args} ${npm_variables})
+  check_result $?
+  build_log2=$(ct_s2i_build_as_df file://${test_dir}/test-incremental ${IMAGE_NAME} ${IMAGE_NAME}-testapp ${s2i_args} ${npm_variables} --incremental)
+  check_result $?
+  if [ "$VERSION" == "6" ]; then
+      # Different npm output for version 6
+      if echo "$build_log2" | grep -e "\-\- yarn@[0-9\.]*"; then
+          echo "ERROR Incremental build failed: yarn package is getting installed in incremental build"
+          check_result 1
+      fi
+  else
+      first=$(echo "$build_log1" | grep -o -e "added [0-9]* packages" | awk '{ print $2 }')
+      second=$(echo "$build_log2" | grep -o -e "added [0-9]* packages" | awk '{ print $2 }')
+      if [ "$first" == "$second" ]; then
+          echo "ERROR Incremental build failed: both builds installed $first packages"
+          check_result 1
+      fi
+  fi
+
+}
+
+# test express webapp
+run_s2i_build_express_webapp() {
+  local result
+  prepare express-webapp
+  ct_s2i_build_as_df file://${test_dir}/test-express-webapp ${IMAGE_NAME} ${IMAGE_NAME}-testexpresswebapp ${s2i_args} $(ct_build_s2i_npm_variables)
+  run_test_application express-webapp &
+  wait_for_cid
+  ct_test_response http://$(container_ip):${test_port} 200 'Welcome to Express Testing Application'
+  result=$?
+  kill_test_application
+  return $result
+}
+
+# Build the application image twice to ensure the 'save-artifacts' and
+# 'restore-artifacts' scripts are working properly
+prepare app
+echo "Testing the production image build"
+run_s2i_build
+check_result $?
+
+# Verify the 'usage' script is working properly when running the base image with 's2i usage ...'
+test_s2i_usage
+check_result $?
+
+# Verify the 'usage' script is working properly when running the base image with 'docker run ...'
+test_docker_run_usage
+check_result $?
+
+# Verify that the HTTP connection can be established to test application container
+run_test_application app &
+
+# Wait for the container to write it's CID file
+wait_for_cid
+
+test_scl_usage "node --version" "v$VERSION."
+check_result $?
+
+test_connection
+check_result $?
+
+# Test that the development dependencies (nodemon) have been removed (npm prune)
+devdep=$(docker run --rm ${IMAGE_NAME}-testapp /bin/bash -c "! test -d ~/node_modules/nodemon")
+check_result $?
+
+# Test that the npm cache has been cleared
+devdep=$(docker run --rm ${IMAGE_NAME}-testapp /bin/bash -c "! test -d \$(npm config get cache)")
+check_result $?
+
+# Test that the npm tmp has been cleared
+devdep=$(docker run --rm ${IMAGE_NAME}-testapp /bin/bash -c "! ls \$(npm config get tmp)/npm-* 2>/dev/null")
+check_result $?
+
+kill_test_application
+
+test_dev_mode app false production
+test_dev_mode app true development
+
+echo "Testing the development image build: s2i build -e \"NODE_ENV=development\")"
+run_s2i_build "-e NODE_ENV=development"
+check_result $?
+
+# Verify that the HTTP connection can be established to test application container
+run_test_application app &
+wait_for_cid
+
+test_connection
+check_result $?
+
+# Test that the development dependencies (nodemon) have NOT been removed
+devdep=$(docker run --rm ${IMAGE_NAME}-testapp /bin/bash -c "test -d ~/node_modules/nodemon")
+check_result $?
+
+# Test that the npm cache has NOT been cleared
+devdep=$(docker run --rm ${IMAGE_NAME}-testapp /bin/bash -c "test -d \$(npm config get cache)")
+check_result $?
+
+kill_test_application
+
+test_dev_mode app true development
+test_dev_mode app false development
+
+echo "Testing the development image build: s2i build -e \"DEV_MODE=true\")"
+run_s2i_build "-e DEV_MODE=true"
+check_result $?
+
+# Verify that the HTTP connection can be established to test application container
+run_test_application app &
+wait_for_cid
+
+test_connection
+check_result $?
+
+# Test that the development dependencies (nodemon) have NOT been removed
+devdep=$(docker run --rm ${IMAGE_NAME}-testapp /bin/bash -c "test -d ~/node_modules/nodemon")
+check_result $?
+
+# Test that the npm cache has NOT been cleared
+devdep=$(docker run --rm ${IMAGE_NAME}-testapp /bin/bash -c "test -d \$(npm config get cache)")
+check_result $?
+
+kill_test_application
+
+test_dev_mode app true development
+test_dev_mode app false production
+
+echo "Testing proxy safe logging..."
+prepare hw
+run_s2i_build_proxy http://user.password@0.0.0.0:8000 https://user.password@0.0.0.0:8000 > /tmp/build-log 2>&1
+if [[ $(grep redacted /tmp/build-log | wc -l) -eq 4 ]]; then
+    grep redacted /tmp/build-log
+    check_result 0
+else
+    echo "Some proxy log-in credentials were left in log file"
+    grep Setting /tmp/build-log
+    check_result 1
+fi
+
+run_test_application hw &
+wait_for_cid
+kill_test_application
+
+echo "Testing incremental build"
+test_incremental_build
+
+echo "Running express webapp test"
+run_s2i_build_express_webapp ; check_result $?
+
+echo "Testing npm availability"
+ct_npm_works
+check_result $?
+
+echo "Running express.js test suite"
+prepare express
+run_s2i_build_express; check_result $?
+run_express_test_suite; check_result $?
+
+# These tests only make sense for rhscl
+if [ "$OS" == "rhel7" ] || [ "$OS" == "centos7" ]; then
+  # autocleanup only enabled here as only the following tests so far use it
+  CID_FILE_DIR=$(mktemp -d)
+  ct_enable_cleanup
+
+  echo "Testing npm availability in Dockerfile"
+  ct_binary_found_from_df npm
+  check_result $?
+
+  echo "Testing variable presence during \`docker exec\`"
+  ct_check_exec_env_vars
+  check_result $?
+
+  echo "Checking if all scl variables are defined in Dockerfile"
+  ct_check_scl_enable_vars
+  check_result $?
+fi
+
+echo "Success!"
+cleanup
